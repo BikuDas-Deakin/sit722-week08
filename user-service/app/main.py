@@ -138,4 +138,4 @@ def health_check() -> dict[str, str]:
     return {
         "status": "healthy",
         "service": "user-service",
-    }
+    }# Triggering CI pipeline for Task 8.1P - Sun 27 Sep 2026 16:16:08 AEST
