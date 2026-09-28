@@ -5,6 +5,11 @@ metadata:
   namespace: production
 spec:
   replicas: 2
+  strategy:
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  minReadySeconds: 5
   selector:
     matchLabels:
       app: frontend
@@ -13,6 +18,7 @@ spec:
       labels:
         app: frontend
     spec:
+      terminationGracePeriodSeconds: 15
       containers:
         - name: frontend
           image: placeholder
@@ -25,6 +31,10 @@ spec:
               port: 80
             initialDelaySeconds: 2
             periodSeconds: 3
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "5"]
 
 ---
 apiVersion: v1
