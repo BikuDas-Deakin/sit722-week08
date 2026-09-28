@@ -1,0 +1,178 @@
+name: 07 - Canary Production Release
+
+on:
+  workflow_run:
+    workflows: ["04 - Deploy to Production"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Frontend image SHA to release (blank = latest commit)"
+        required: false
+        type: string
+
+concurrency:
+  group: canary-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  canary:
+    name: Canary release (frontend)
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    environment:
+      name: production
+    env:
+      IMAGE_TAG: ${{ inputs.image_tag || github.event.workflow_run.head_sha || github.sha }}
+      NEW_IMAGE: ${{ vars.ACR_LOGIN_SERVER }}/koalatech-frontend:${{ inputs.image_tag || github.event.workflow_run.head_sha || github.sha }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.IMAGE_TAG }}
+
+      - name: Login to Azure
+        uses: azure/login@v3
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get AKS credentials
+        run: |
+          az aks get-credentials \
+            --resource-group ${{ vars.AKS_RESOURCE_GROUP }} \
+            --name ${{ vars.AKS_CLUSTER_NAME }} \
+            --overwrite-existing
+
+      - name: Prepare stable frontend (Deployment, Service, Ingress)
+        id: prep
+        run: |
+          set -euo pipefail
+          kubectl create namespace production --dry-run=client -o yaml | kubectl apply -f -
+          if kubectl get deployment frontend -n production >/dev/null 2>&1; then
+            STABLE_IMAGE=$(kubectl get deployment frontend -n production -o jsonpath='{.spec.template.spec.containers[0].image}')
+            FIRST=false
+          else
+            STABLE_IMAGE="$NEW_IMAGE"
+            FIRST=true
+          fi
+          # Apply the manifest but keep whatever image is currently stable
+          sed "s#image: placeholder#image: ${STABLE_IMAGE}#" kubernetes/production/12-frontend.yaml | kubectl apply -f -
+          kubectl rollout status deployment/frontend -n production --timeout=300s
+          echo "stable_image=$STABLE_IMAGE" >> "$GITHUB_OUTPUT"
+          echo "first=$FIRST" >> "$GITHUB_OUTPUT"
+          echo "HOST=$(kubectl get ingress frontend-stable -n production -o jsonpath='{.spec.rules[0].host}')" >> "$GITHUB_ENV"
+
+      - name: Decide whether a canary is needed
+        id: decide
+        run: |
+          if [ "${{ steps.prep.outputs.first }}" = "true" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "First deployment: $NEW_IMAGE is now stable, no canary needed."
+          elif [ "${{ steps.prep.outputs.stable_image }}" = "$NEW_IMAGE" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Stable already runs $NEW_IMAGE, nothing to release."
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "Releasing $NEW_IMAGE as a canary against ${{ steps.prep.outputs.stable_image }}"
+          fi
+
+      - name: Start canary at 10%
+        if: steps.decide.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          sed "s#CANARY_IMAGE#${NEW_IMAGE}#" kubernetes/canary/frontend-canary.yaml | kubectl apply -f -
+          kubectl rollout status deployment/frontend-canary -n production --timeout=180s
+          sleep 10
+          kubectl get ingress -n production
+
+      - name: Gate at 10% traffic
+        if: steps.decide.outputs.run == 'true'
+        run: SUMMARY_FILE=/tmp/gate-10.txt ./scripts/canary-gate.sh 600
+
+      - name: Raise canary to 50%
+        if: steps.decide.outputs.run == 'true'
+        run: |
+          ./scripts/canary-weight.sh 50
+          sleep 5
+
+      - name: Gate at 50% traffic
+        if: steps.decide.outputs.run == 'true'
+        run: SUMMARY_FILE=/tmp/gate-50.txt ./scripts/canary-gate.sh 600
+
+      - name: Promote to 100% (rolling update of stable Deployment)
+        if: steps.decide.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          echo "PROMOTED=true" >> "$GITHUB_ENV"
+          kubectl set image deployment/frontend frontend="$NEW_IMAGE" -n production
+          kubectl rollout status deployment/frontend -n production --timeout=300s
+
+      - name: Retire canary
+        if: steps.decide.outputs.run == 'true'
+        run: |
+          kubectl delete ingress/frontend-canary -n production --ignore-not-found
+          kubectl delete service/frontend-canary deployment/frontend-canary -n production --ignore-not-found
+
+      - name: Post-promotion watch (stable must stay healthy)
+        if: steps.decide.outputs.run == 'true'
+        run: CANARY_LABEL="" SUMMARY_FILE=/tmp/gate-watch.txt ./scripts/canary-gate.sh 300
+
+      - name: Success summary
+        if: success() && steps.decide.outputs.run == 'true'
+        run: |
+          {
+            echo "## Canary release succeeded"
+            echo "- Promoted \`${IMAGE_TAG}\` to 100% after passing every gate."
+            for f in gate-10 gate-50 gate-watch; do
+              if [ -f "/tmp/$f.txt" ]; then echo "- $f: $(cat /tmp/$f.txt)"; fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------------- failure path: diagnose, roll back, alert ----------------
+      - name: Collect diagnostics
+        if: failure() && steps.decide.outputs.run == 'true'
+        run: |
+          {
+            echo "## Canary release failed and was rolled back"
+            echo
+            echo "- Image SHA: \`${IMAGE_TAG}\`"
+            echo "- Stable image kept: \`${{ steps.prep.outputs.stable_image }}\`"
+            echo "- Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo
+            echo "### Gate results"
+            for f in gate-10 gate-50 gate-watch; do
+              if [ -f "/tmp/$f.txt" ]; then echo "- $f: $(cat /tmp/$f.txt)"; fi
+            done
+            echo
+            echo "### Recent canary pod logs"
+            echo '```'
+            kubectl logs deployment/frontend-canary -n production --tail=25 2>&1 || echo "(canary already removed)"
+            echo '```'
+          } > /tmp/issue.md
+          cat /tmp/issue.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Roll back
+        if: failure() && steps.decide.outputs.run == 'true'
+        run: |
+          kubectl delete ingress/frontend-canary -n production --ignore-not-found
+          kubectl delete service/frontend-canary deployment/frontend-canary -n production --ignore-not-found
+          if [ "${PROMOTED:-false}" = "true" ]; then
+            kubectl rollout undo deployment/frontend -n production
+            kubectl rollout status deployment/frontend -n production --timeout=300s
+          fi
+          kubectl get deploy,ingress -n production | grep -E "NAME|frontend"
+
+      - name: Open alert issue
+        if: failure() && steps.decide.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create --repo "${{ github.repository }}" \
+            --title "Canary rollback: frontend ${IMAGE_TAG:0:7} failed the health gate" \
+            --body-file /tmp/issue.md

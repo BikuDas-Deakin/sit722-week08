@@ -1,12 +1,6 @@
 name: 05 - Terraform Infrastructure
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - "terraform/**"
-
   workflow_dispatch:
 
 jobs:

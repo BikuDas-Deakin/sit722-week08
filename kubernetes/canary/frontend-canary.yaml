@@ -1,21 +1,21 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: frontend
+  name: frontend-canary
   namespace: production
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
-      app: frontend
+      app: frontend-canary
   template:
     metadata:
       labels:
-        app: frontend
+        app: frontend-canary
     spec:
       containers:
         - name: frontend
-          image: placeholder
+          image: CANARY_IMAGE
           imagePullPolicy: Always
           ports:
             - containerPort: 80
@@ -30,12 +30,12 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: frontend
+  name: frontend-canary
   namespace: production
 spec:
   type: ClusterIP
   selector:
-    app: frontend
+    app: frontend-canary
   ports:
     - port: 80
       targetPort: 80
@@ -44,9 +44,11 @@ spec:
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: frontend-stable
+  name: frontend-canary
   namespace: production
   annotations:
+    nginx.ingress.kubernetes.io/canary: "true"
+    nginx.ingress.kubernetes.io/canary-weight: "10"
     nginx.ingress.kubernetes.io/proxy-body-size: "10m"
 spec:
   ingressClassName: nginx
@@ -58,6 +60,6 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: frontend
+                name: frontend-canary
                 port:
                   number: 80

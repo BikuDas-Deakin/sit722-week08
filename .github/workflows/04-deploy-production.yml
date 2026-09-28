@@ -64,16 +64,14 @@ jobs:
             --dry-run=client \
             -o yaml | kubectl apply -f -
 
-      - name: Apply Kubernetes manifests
+      - name: Apply Kubernetes manifests (frontend is owned by workflow 07)
         run: |
-          kubectl apply \
-            -f kubernetes/production/
-
-      - name: Update frontend image
-        run: |
-          kubectl set image deployment/frontend \
-            frontend=${{ vars.ACR_LOGIN_SERVER }}/koalatech-frontend:${{ env.IMAGE_TAG }} \
-            -n production
+          for f in kubernetes/production/*.yaml; do
+            case "$f" in
+              *12-frontend.yaml) continue ;;
+            esac
+            kubectl apply -f "$f"
+          done
 
       - name: Update user-service image
         run: |
@@ -104,12 +102,6 @@ jobs:
           kubectl set image deployment/enrollment-service \
             enrollment-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-enrollment-service:${{ env.IMAGE_TAG }} \
             -n production
-
-      - name: Wait for frontend rollout
-        run: |
-          kubectl rollout status deployment/frontend \
-            -n production \
-            --timeout=300s
 
       - name: Wait for user-service rollout
         run: |
